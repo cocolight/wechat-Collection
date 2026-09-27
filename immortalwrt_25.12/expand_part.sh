@@ -8,7 +8,8 @@
 #   ./expand.sh -d /dev/nvme0n1 -p 2  # 指定盘和分区号，仍逐步确认
 #   ./expand.sh -d /dev/nvme0n1 -p 2 -y   # 一键跑完（确认项全部默认 yes）
 #   ./expand.sh --dry-run             # 只打印将要执行的命令，不做任何改动
-#   ./expand.sh --size 60G            # 只扩到 60G，而不是吃满整盘
+#   ./expand.sh --size 60G            # 只扩到 60GiB，不吃满整盘
+#                                     # 可写：60G(=GiB) / 60GB(=十进制) / 61440MiB / 45% / 100%
 #
 # 设计原则：
 #   1. 不硬编码设备名/分区号：磁盘、分区、目标大小都由探测 + 用户选择决定。
@@ -136,6 +137,37 @@ info "Log file: ${LOG_FILE}"
 
 # 当前运行系统的根设备，用于拒绝"在线扩容"
 ROOT_SRC="$(findmnt -no SOURCE / 2>/dev/null || true)"
+
+# 把 parted 的尺寸写法换算成"分区将占用的扇区数"，仅用于校验，不参与实际执行。
+# 支持：s / B / kB / K / KiB / MB / M / MiB / GB / G / GiB / TB / T / TiB / <n>%
+# 简写映射：G=GiB、M=MiB、T=TiB、K=KiB（分区语境习惯按 1024 进制）
+# 不带单位一律拒绝——parted 的裸数字含义取决于当前 unit，太容易误解。
+to_sectors() {
+    local spec="$1" num unit bytes
+    [[ "$spec" == *"%"* ]] && {
+        num="${spec%\%}"
+        [[ "$num" =~ ^[0-9]+(\.[0-9]+)?$ ]] || return 1
+        awk -v n="$num" -v s="$CUR_START" -v e="$DISK_END" \
+            'BEGIN{printf "%d", (e-s+1)*n/100}'
+        return
+    }
+    [[ "$spec" =~ ^([0-9]+(\.[0-9]+)?)([A-Za-z]*)$ ]] || return 1
+    num="${BASH_REMATCH[1]}"; unit="${BASH_REMATCH[3]}"
+    case "$unit" in
+        s|S)   awk -v n="$num" 'BEGIN{printf "%d", n}'; return ;;
+        B)     bytes="$num" ;;
+        kB)    bytes=$(awk -v n="$num" 'BEGIN{printf "%d", n*1000}') ;;
+        K|KiB|kiB) bytes=$(awk -v n="$num" 'BEGIN{printf "%d", n*1024}') ;;
+        MB)    bytes=$(awk -v n="$num" 'BEGIN{printf "%d", n*1000000}') ;;
+        M|MiB) bytes=$(awk -v n="$num" 'BEGIN{printf "%d", n*1048576}') ;;
+        GB)    bytes=$(awk -v n="$num" 'BEGIN{printf "%d", n*1000000000}') ;;
+        G|GiB) bytes=$(awk -v n="$num" 'BEGIN{printf "%d", n*1073741824}') ;;
+        TB)    bytes=$(awk -v n="$num" 'BEGIN{printf "%d", n*1000000000000}') ;;
+        T|TiB) bytes=$(awk -v n="$num" 'BEGIN{printf "%d", n*1099511627776}') ;;
+        *)     return 1 ;;
+    esac
+    awk -v b="$bytes" 'BEGIN{printf "%d", b/512}'
+}
 
 # ------------------------------ 1. 选择磁盘 ------------------------------
 pick_disk() {
@@ -275,17 +307,55 @@ if [[ -z "$TARGET_SIZE" ]]; then
         local_safe_mb=$(( (NEXT_START*512 - 1048576) / 1048576 ))
         printf '  2) %sMiB - stop right before the next partition (no overlap)\n' "$local_safe_mb"
     fi
-    printf '  3) custom - type a size yourself, e.g. 60G / 40960M\n'
+    printf '  3) custom - type a size yourself, e.g. 60G / 60GiB / 61440MiB\n'
     read -r -p "Choose [1]: " size_choice
     case "${size_choice:-1}" in
         1|"")  TARGET_SIZE="100%" ;;
         2)     [[ -n "$NEXT_START" ]] && TARGET_SIZE="${local_safe_mb}MiB" || { warn "No next partition; using 100%."; TARGET_SIZE="100%"; } ;;
-        3)     read -r -p "Size (parted syntax, e.g. 60G): " TARGET_SIZE ;;
+        3)     read -r -p "Size (e.g. 60G = 60GiB, 60GB = decimal, 100%): " TARGET_SIZE ;;
         *)     TARGET_SIZE="100%" ;;
     esac
 fi
 [[ -n "$TARGET_SIZE" ]] || TARGET_SIZE="100%"
-ok "Target end: $TARGET_SIZE"
+
+# 目标大小校验：不能比现在小（本脚本只扩不缩），不能超出盘尾，重叠要警告
+CUR_SECTORS=$(( CUR_END - CUR_START + 1 ))
+WANT_SECTORS="$(to_sectors "$TARGET_SIZE")" || die \
+    "Cannot parse size '$TARGET_SIZE'. Use an explicit unit: 60G / 60GiB / 60GB / 61440MiB / 100%"
+[[ -n "$WANT_SECTORS" && "$WANT_SECTORS" -gt 0 ]] || die "Size '$TARGET_SIZE' resolves to 0 sectors."
+
+WANT_END=$(( CUR_START + WANT_SECTORS - 1 ))
+CUR_GIB="$(awk -v s="$CUR_SECTORS" 'BEGIN{printf "%.2f GiB", s*512/1073741824}')"
+WANT_GIB="$(awk -v s="$WANT_SECTORS" 'BEGIN{printf "%.2f GiB", s*512/1073741824}')"
+
+step "Target size check"
+printf '  requested        : %s\n' "$TARGET_SIZE"
+printf '  partition size   : %s sectors (%s)  ->  %s sectors (%s)\n' \
+    "$CUR_SECTORS" "$CUR_GIB" "$WANT_SECTORS" "$WANT_GIB"
+printf '  new end sector   : %s (disk ends at %s)\n' "$WANT_END" "$DISK_END"
+
+if (( WANT_SECTORS <= CUR_SECTORS )); then
+    die "Target ($WANT_GIB) is NOT larger than the current partition ($CUR_GIB).
+  This script only GROWS partitions. Shrinking would destroy data at the tail.
+  If you really need to shrink: back up first, shrink the FILESYSTEM (resize2fs)
+  before the PARTITION, and never the other way around."
+fi
+if (( WANT_END > DISK_END )); then
+    die "Target end sector $WANT_END exceeds the disk end ($DISK_END). Pick something smaller."
+fi
+if [[ -n "$NEXT_START" ]] && (( WANT_END >= NEXT_START )); then
+    warn "Target overlaps the partition starting at sector $NEXT_START."
+    if [[ "$TARGET_SIZE" != "100%" ]]; then
+        local_safe_mb=$(( (NEXT_START*512 - 1048576) / 1048576 ))
+        if confirm "Use the non-overlapping size ${local_safe_mb}MiB instead?"; then
+            TARGET_SIZE="${local_safe_mb}MiB"
+            WANT_SECTORS="$(to_sectors "$TARGET_SIZE")"
+            WANT_END=$(( CUR_START + WANT_SECTORS - 1 ))
+            ok "Adjusted to $TARGET_SIZE (end sector $WANT_END)."
+        fi
+    fi
+fi
+ok "Target: $TARGET_SIZE (~$WANT_GIB, end sector $WANT_END)"
 
 # ------------------------------ 6. 最终确认 ------------------------------
 step "Plan"
